@@ -1,8 +1,9 @@
 {
   "name": "secure-file-exchange-demo",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "双安全区受控文件交换演示系统",
+  "description": "Rocky Linux 双安全区受控文件交换系统",
+  "dependencies": { "ldapjs": "^3.0.7" },
   "scripts": {
     "start": "node server.js"
   }

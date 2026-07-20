@@ -1,133 +1,36 @@
 const http = require('node:http');
+const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+let ldap;
 
-const PORT_OFFICE = Number(process.env.OFFICE_PORT || 8080);
-const PORT_RD = Number(process.env.RD_PORT || 8081);
-const APP_PORT = Number(process.env.PORT || 8080);
-const OFFICE_IP = process.env.OFFICE_IP || '';
-const RD_IP = process.env.RD_IP || '';
-const DATA_DIR = path.join(__dirname, 'data');
-const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
-const RELEASE_DIR = path.join(DATA_DIR, 'released');
-const DB_PATH = path.join(DATA_DIR, 'tasks.json');
-const AUDIT_PATH = path.join(DATA_DIR, 'audit.jsonl');
-const MAX_BYTES = 10 * 1024 * 1024;
-const ALLOWED_EXTENSIONS = new Set(['.txt', '.pdf', '.csv', '.png', '.jpg', '.jpeg']);
-
-for (const folder of [DATA_DIR, UPLOAD_DIR, RELEASE_DIR]) fs.mkdirSync(folder, { recursive: true });
-if (!fs.existsSync(DB_PATH)) fs.writeFileSync(DB_PATH, '[]\n', 'utf8');
-
-function readTasks() { return JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); }
-function saveTasks(tasks) { fs.writeFileSync(DB_PATH, JSON.stringify(tasks, null, 2), 'utf8'); }
-function audit(event, detail) {
-  fs.appendFileSync(AUDIT_PATH, JSON.stringify({ at: new Date().toISOString(), event, ...detail }) + '\n', 'utf8');
+const C = { officeHost:process.env.OFFICE_BIND||'127.0.0.1', officePort:+(process.env.OFFICE_PORT||8080), rdHost:process.env.RD_BIND||'127.0.0.1', rdPort:+(process.env.RD_PORT||8081), data:process.env.DATA_DIR||path.join(__dirname,'data'), max:+(process.env.MAX_UPLOAD_MB||10)*1048576, secure:process.env.COOKIE_SECURE==='true', ldapUrl:process.env.LDAP_URL||'', bindDn:process.env.LDAP_BIND_DN||'', bindPassword:process.env.LDAP_BIND_PASSWORD||'', baseDn:process.env.LDAP_BASE_DN||'', ca:process.env.LDAP_TLS_CA_FILE||'', adminGroups:(process.env.LDAP_ADMIN_GROUPS||'').split(';').filter(Boolean), approverGroups:(process.env.LDAP_APPROVER_GROUPS||'').split(';').filter(Boolean) };
+const P={tasks:path.join(C.data,'tasks.json'),users:path.join(C.data,'users.json'),sessions:path.join(C.data,'sessions.json'),audit:path.join(C.data,'audit.jsonl'),uploads:path.join(C.data,'uploads'),released:path.join(C.data,'released')}; const TYPES=new Set(['.txt','.pdf','.csv','.png','.jpg','.jpeg']);
+for(const d of [C.data,P.uploads,P.released])fs.mkdirSync(d,{recursive:true,mode:0o750}); for(const f of [P.tasks,P.users,P.sessions])if(!fs.existsSync(f))fs.writeFileSync(f,'[]\n',{mode:0o600});
+const load=n=>{try{return JSON.parse(fs.readFileSync(P[n],'utf8'))}catch{return[]}},save=(n,v)=>fs.writeFileSync(P[n],JSON.stringify(v,null,2)+'\n',{mode:0o600}),now=()=>new Date().toISOString(),safe=(v,n=160)=>String(v||'').replace(/[\r\n\0]/g,'').trim().slice(0,n),audit=(event,x={})=>fs.appendFileSync(P.audit,JSON.stringify({at:now(),event,...x})+'\n',{mode:0o600}),zoneName=z=>z==='office'?'办公网':'研发网';
+function hash(v,salt=crypto.randomBytes(16)){return new Promise((ok,no)=>crypto.scrypt(v,salt,64,{N:16384,r:8,p:1},(e,k)=>e?no(e):ok(`scrypt$${salt.toString('base64')}$${k.toString('base64')}`)))}
+async function check(v,h){const [a,s]=String(h||'').split('$');if(a!=='scrypt'||!s)return false;return crypto.timingSafeEqual(Buffer.from(await hash(v,Buffer.from(s,'base64'))),Buffer.from(h))}
+function cookie(req){return Object.fromEntries(String(req.headers.cookie||'').split(';').map(x=>x.trim().split(/=(.*)/s)).filter(x=>x[1]).map(x=>[x[0],decodeURIComponent(x[1])]))} function setCookie(v,age){return `sfx_session=${encodeURIComponent(v)}; Path=/; HttpOnly; SameSite=Strict${C.secure?'; Secure':''}; Max-Age=${age}`}
+function session(req){const sid=cookie(req).sfx_session, s=load('sessions').find(x=>x.id===sid&&new Date(x.exp)>new Date());if(!s)return null;const u=load('users').find(x=>x.id===s.userId&&!x.disabled);return u?{...s,user:u}:null} function makeSession(u){const a=load('sessions').filter(x=>new Date(x.exp)>new Date()),s={id:crypto.randomBytes(32).toString('base64url'),csrf:crypto.randomBytes(24).toString('base64url'),userId:u.id,exp:new Date(Date.now()+28800000).toISOString()};a.push(s);save('sessions',a);return s}
+function json(res,c,v,h={}){res.writeHead(c,{'content-type':'application/json; charset=utf-8','cache-control':'no-store',...h});res.end(JSON.stringify(v))} function raw(req,max=C.max+1048576){return new Promise((ok,no)=>{let n=0,a=[];req.on('data',x=>{n+=x.length;if(n>max){no(Error('请求过大'));req.destroy()}else a.push(x)});req.on('end',()=>ok(Buffer.concat(a)));req.on('error',no)})}
+function auth(req,res,z,role,csrf=false){const s=session(req);if(!s){json(res,401,{error:'请先登录'});return}if(!s.user.zones.includes(z)){json(res,403,{error:'当前账号未获授权访问该安全区'});return}if(csrf&&req.headers['x-csrf-token']!==s.csrf){json(res,403,{error:'CSRF 校验失败'});return}if(role&&!s.user.roles.includes(role)){json(res,403,{error:'权限不足'});return}return s}
+function mp(b,t){const x=/boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(t||'');if(!x)throw Error('请求格式错误');const d=Buffer.from('--'+(x[1]||x[2]));let i=0,f={},file;while(1){const p=b.indexOf(d,i);if(p<0)break;const s=p+d.length;if(b.subarray(s,s+2).toString()==='--')break;const e=b.indexOf(Buffer.from('\r\n\r\n'),s+2),q=b.indexOf(d,e+4);if(e<0||q<0)break;const h=b.subarray(s+2,e).toString(),v=b.subarray(e+4,q-2),name=/name="([^"]+)"/.exec(h)?.[1],fn=/filename="([^"]*)"/.exec(h)?.[1];if(name==='file'&&fn!==undefined)file={name:path.basename(safe(fn,120)).replace(/[^\w.\-\u4e00-\u9fa5]/g,'_'),bytes:v};else if(name)f[name]=safe(v.toString(),300);i=q}return{f,file}}
+function escLdap(v){return String(v).replace(/\\/g,'\\5c').replace(/\*/g,'\\2a').replace(/\(/g,'\\28').replace(/\)/g,'\\29').replace(/\0/g,'\\00')}
+function ldapBind(c,d,p){return new Promise((ok,no)=>c.bind(d,p,e=>e?no(e):ok()))} function ldapFind(c,b,o){return new Promise((ok,no)=>c.search(b,o,(e,r)=>{if(e)return no(e);let a=[];r.on('searchEntry',x=>a.push(x.object));r.on('error',no);r.on('end',()=>ok(a))}))}
+async function adLogin(username,password){if(!C.ldapUrl)return null;try{ldap=require('ldapjs')}catch{throw Error('未安装 ldapjs；请执行 npm install')}if(!C.ldapUrl.startsWith('ldaps://')||!C.bindDn||!C.bindPassword||!C.baseDn)throw Error('AD 配置不完整或未使用 LDAPS');const opts={url:C.ldapUrl,tlsOptions:{rejectUnauthorized:true}};if(C.ca)opts.tlsOptions.ca=[fs.readFileSync(C.ca)];let c=ldap.createClient(opts);try{await ldapBind(c,C.bindDn,C.bindPassword);const a=await ldapFind(c,C.baseDn,{scope:'sub',sizeLimit:2,filter:`(&(objectClass=user)(sAMAccountName=${escLdap(username)}))`,attributes:['dn','sAMAccountName','displayName','mail','memberOf','userAccountControl','objectGUID']});if(a.length!==1||(+(a[0].userAccountControl||0)&2))throw Error('AD 用户不存在或已禁用');let u=ldap.createClient(opts);try{await ldapBind(u,a[0].dn,password)}finally{u.unbind()}const g=Array.isArray(a[0].memberOf)?a[0].memberOf:(a[0].memberOf?[a[0].memberOf]:[]),has=gs=>gs.some(n=>g.some(v=>v.toLowerCase()===n.toLowerCase()));return{username:String(a[0].sAMAccountName),displayName:a[0].displayName||a[0].sAMAccountName,email:a[0].mail||'',roles:has(C.adminGroups)?['admin','approver','user']:has(C.approverGroups)?['approver','user']:['user']}}finally{c.unbind()}}
+async function api(req,res,z,url){
+ if(req.method==='GET'&&url.pathname==='/api/context'){const s=session(req);return json(res,200,{zone:z,zoneLabel:zoneName(z),authenticated:!!s,user:s?{username:s.user.username,displayName:s.user.displayName,roles:s.user.roles,zones:s.user.zones,csrf:s.csrf}:null})}
+ if(req.method==='POST'&&url.pathname==='/api/login'){try{const d=JSON.parse((await raw(req,16384)).toString()),un=safe(d.username,64),pw=String(d.password||'');let users=load('users'),u=users.find(x=>x.username.toLowerCase()===un.toLowerCase());if(u?.source==='local'){if(u.disabled||!(await check(pw,u.passwordHash)))throw Error('用户名或密码错误')}else{const ad=await adLogin(un,pw);if(!ad)throw Error('用户名或密码错误');if(u&&u.source!=='ad')throw Error('本地和 AD 同名账户冲突');if(!u){u={id:crypto.randomUUID(),username:ad.username,displayName:ad.displayName,email:ad.email,source:'ad',roles:ad.roles,zones:['office','rd'],disabled:false,createdAt:now()};users.push(u)}else{u.roles=ad.roles;u.displayName=ad.displayName;u.email=ad.email}save('users',users)}const s=makeSession(u);audit('login_success',{username:u.username,zone:z});return json(res,200,{user:{username:u.username,displayName:u.displayName,roles:u.roles,zones:u.zones},csrf:s.csrf},{'set-cookie':setCookie(s.id,28800)})}catch(e){audit('login_failed',{zone:z,reason:safe(e.message)});return json(res,401,{error:e.message})}}
+ if(req.method==='POST'&&url.pathname==='/api/logout'){const s=auth(req,res,z,null,true);if(!s)return;save('sessions',load('sessions').filter(x=>x.id!==s.id));audit('logout',{username:s.user.username,zone:z});return json(res,200,{ok:true},{'set-cookie':setCookie('',0)})}
+ if(req.method==='GET'&&url.pathname==='/api/tasks'){const s=auth(req,res,z);if(!s)return;const tasks=load('tasks').filter(t=>t.sourceZone===z||(t.targetZone===z&&t.recipient===s.user.username)).map(t=>({...t,canApprove:t.sourceZone===z&&t.status==='pending'&&t.submittedBy!==s.user.username&&(s.user.roles.includes('approver')||s.user.roles.includes('admin')),canDownload:t.targetZone===z&&t.recipient===s.user.username&&t.status==='released'}));return json(res,200,{tasks})}
+ if(req.method==='POST'&&url.pathname==='/api/tasks'){const s=auth(req,res,z,null,true);if(!s)return;try{const{f,file}=mp(await raw(req),req.headers['content-type']);if(!file?.bytes.length)throw Error('请选择文件');if(file.bytes.length>C.max)throw Error('文件超过大小限制');const ext=path.extname(file.name).toLowerCase();if(!TYPES.has(ext))throw Error('文件类型不允许');if(/(SECRET|AKIA[0-9A-Z]{16}|BEGIN (RSA |OPENSSH )?PRIVATE KEY)/i.test(file.bytes.subarray(0,524288).toString()))throw Error('模拟 DLP 已阻断敏感内容');const target=z==='office'?'rd':'office',recipient=safe(f.recipient,64),ru=load('users').find(x=>x.username===recipient&&!x.disabled&&x.zones.includes(target));if(!ru)throw Error('目标接收人不存在或无目标区权限');const physical=crypto.randomUUID()+ext;fs.writeFileSync(path.join(P.uploads,physical),file.bytes,{mode:0o600});const t={id:'fx-'+crypto.randomUUID(),originalName:file.name,physical,size:file.bytes.length,sha256:crypto.createHash('sha256').update(file.bytes).digest('hex'),sourceZone:z,targetZone:target,recipient,purpose:safe(f.purpose,200),sensitivity:safe(f.sensitivity,30)||'内部',status:'pending',submittedBy:s.user.username,createdAt:now()};let a=load('tasks');a.push(t);save('tasks',a);audit('submitted_and_scanned',{...t,username:s.user.username});return json(res,201,{message:'文件已通过基础检测，等待审批'})}catch(e){return json(res,400,{error:e.message})}}
+ const d=/^\/api\/tasks\/([^/]+)\/(approve|reject)$/.exec(url.pathname);if(req.method==='POST'&&d){const s=auth(req,res,z,'approver',true);if(!s)return;let a=load('tasks'),t=a.find(x=>x.id===d[1]);if(!t||t.sourceZone!==z||t.status!=='pending'||t.submittedBy===s.user.username)return json(res,404,{error:'未找到可审批任务'});t.status=d[2]==='approve'?'released':'rejected';t.approvalBy=s.user.username;t.approvedAt=now();if(t.status==='released')fs.copyFileSync(path.join(P.uploads,t.physical),path.join(P.released,t.physical));save('tasks',a);audit(d[2],{...t,username:s.user.username});return json(res,200,{ok:true})}
+ const dl=/^\/api\/tasks\/([^/]+)\/download$/.exec(url.pathname);if(req.method==='GET'&&dl){const s=auth(req,res,z);if(!s)return;let a=load('tasks'),t=a.find(x=>x.id===dl[1]);if(!t||t.targetZone!==z||t.recipient!==s.user.username||t.status!=='released')return json(res,403,{error:'无下载权限'});t.downloadedAt=now();save('tasks',a);audit('downloaded',{...t,username:s.user.username});const f=path.join(P.released,t.physical);res.writeHead(200,{'content-type':'application/octet-stream','content-disposition':`attachment; filename="${encodeURIComponent(t.originalName)}"`});return fs.createReadStream(f).pipe(res)}
+ if(url.pathname==='/api/users'&&req.method==='GET'){const s=auth(req,res,z,'admin');if(!s)return;return json(res,200,{users:load('users').map(({passwordHash,...u})=>u)})}
+ if(url.pathname==='/api/users'&&req.method==='POST'){const s=auth(req,res,z,'admin',true);if(!s)return;try{const d=JSON.parse((await raw(req,16384)).toString()),un=safe(d.username,64),zones=(d.zones||[]).filter(x=>['office','rd'].includes(x)),roles=(d.roles||[]).filter(x=>['user','approver','admin'].includes(x));if(!/^[A-Za-z0-9._-]{3,64}$/.test(un)||String(d.password||'').length<12||!zones.length)throw Error('用户名、12位以上密码或区域配置无效');let a=load('users');if(a.some(x=>x.username.toLowerCase()===un.toLowerCase()))throw Error('用户名已存在');const u={id:crypto.randomUUID(),username:un,displayName:safe(d.displayName,80)||un,source:'local',passwordHash:await hash(String(d.password)),roles:roles.length?roles:['user'],zones,disabled:false,createdAt:now()};a.push(u);save('users',a);audit('local_user_created',{username:s.user.username,createdUser:un});return json(res,201,{ok:true})}catch(e){return json(res,400,{error:e.message})}}
+ return json(res,404,{error:'接口不存在'});
 }
-function json(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(JSON.stringify(body));
-}
-function zoneFor(req, fixedZone) {
-  if (fixedZone) return fixedZone; // 本机演示由独立端口固定区域
-  const localIp = String(req.socket.localAddress || '').replace('::ffff:', '');
-  if (OFFICE_IP && localIp === OFFICE_IP) return 'office';
-  if (RD_IP && localIp === RD_IP) return 'rd';
-  return null;
-}
-function label(zone) { return zone === 'office' ? '办公网' : '研发网'; }
-function cleanName(name) { return path.basename(String(name || 'file')).replace(/[^\w.\-\u4e00-\u9fa5]/g, '_').slice(0, 120); }
-function requestBody(req) {
-  return new Promise((resolve, reject) => {
-    let total = 0; const chunks = [];
-    req.on('data', c => { total += c.length; if (total > MAX_BYTES + 1024 * 1024) { reject(new Error('文件超过 10 MB 限制')); req.destroy(); } else chunks.push(c); });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-function parseMultipart(body, contentType) {
-  const hit = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType || '');
-  if (!hit) throw new Error('请求格式错误');
-  const boundary = Buffer.from(`--${hit[1] || hit[2]}`);
-  const fields = {}; let file = null; let cursor = 0;
-  while (true) {
-    const begin = body.indexOf(boundary, cursor); if (begin < 0) break;
-    const start = begin + boundary.length;
-    if (body.subarray(start, start + 2).equals(Buffer.from('--'))) break;
-    const headerStart = start + 2;
-    const headerEnd = body.indexOf(Buffer.from('\r\n\r\n'), headerStart); if (headerEnd < 0) break;
-    const headers = body.subarray(headerStart, headerEnd).toString('utf8');
-    const next = body.indexOf(boundary, headerEnd + 4); if (next < 0) break;
-    const value = body.subarray(headerEnd + 4, next - 2);
-    const name = /name="([^"]+)"/i.exec(headers)?.[1];
-    const filename = /filename="([^"]*)"/i.exec(headers)?.[1];
-    if (filename !== undefined && name === 'file') file = { name: cleanName(filename), bytes: value };
-    else if (name) fields[name] = value.toString('utf8').slice(0, 300);
-    cursor = next;
-  }
-  return { fields, file };
-}
-function taskView(task, zone) {
-  const outgoing = task.sourceZone === zone;
-  return { ...task, direction: outgoing ? 'outgoing' : 'incoming', canApprove: outgoing && task.status === 'pending_approval', canDownload: task.targetZone === zone && task.status === 'released' };
-}
-function handleApi(req, res, zone, url) {
-  if (req.method === 'GET' && url.pathname === '/api/context') return json(res, 200, { zone, zoneLabel: label(zone), entry: req.socket.localAddress, demo: true });
-  if (req.method === 'GET' && url.pathname === '/api/tasks') {
-    const tasks = readTasks().filter(t => t.sourceZone === zone || t.targetZone === zone).map(t => taskView(t, zone));
-    return json(res, 200, { tasks: tasks.sort((a, b) => b.createdAt.localeCompare(a.createdAt)) });
-  }
-  if (req.method === 'GET' && url.pathname === '/api/audit') {
-    const lines = fs.existsSync(AUDIT_PATH) ? fs.readFileSync(AUDIT_PATH, 'utf8').trim().split('\n').filter(Boolean).slice(-80).map(JSON.parse) : [];
-    return json(res, 200, { events: lines.filter(e => e.sourceZone === zone || e.targetZone === zone || !e.sourceZone).reverse() });
-  }
-  if (req.method === 'POST' && url.pathname === '/api/tasks') return requestBody(req).then(body => {
-    const { fields, file } = parseMultipart(body, req.headers['content-type']);
-    if (!file || !file.bytes.length) throw new Error('请选择一个文件');
-    if (file.bytes.length > MAX_BYTES) throw new Error('文件超过 10 MB 限制');
-    const ext = path.extname(file.name).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.has(ext)) throw new Error(`不允许 ${ext || '无扩展名'} 文件；Demo 仅允许 ${[...ALLOWED_EXTENSIONS].join('、')}`);
-    const targetZone = zone === 'office' ? 'rd' : 'office';
-    const textSample = file.bytes.subarray(0, 1024 * 512).toString('utf8');
-    if (/(SECRET|AKIA[0-9A-Z]{16}|BEGIN (RSA |OPENSSH )?PRIVATE KEY)/i.test(textSample)) throw new Error('模拟 DLP 已阻断：检测到敏感标识或密钥特征');
-    const id = `FX-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
-    const physical = `${crypto.randomUUID()}${ext}`;
-    const sha256 = crypto.createHash('sha256').update(file.bytes).digest('hex');
-    fs.writeFileSync(path.join(UPLOAD_DIR, physical), file.bytes, { mode: 0o600 });
-    const task = { id, originalName: file.name, physical, size: file.bytes.length, sha256, sourceZone: zone, targetZone, recipient: cleanName(fields.recipient || '目标区接收人'), purpose: cleanName(fields.purpose || '未填写用途'), sensitivity: fields.sensitivity || '内部', status: 'pending_approval', createdAt: new Date().toISOString(), approvedAt: null, downloadedAt: null };
-    const tasks = readTasks(); tasks.push(task); saveTasks(tasks);
-    audit('submitted_and_scanned', task); json(res, 201, { task: taskView(task, zone), message: '文件已通过模拟基础检测，等待安全审批。' });
-  }).catch(err => json(res, 400, { error: err.message }));
-  const approval = /^\/api\/tasks\/([^/]+)\/(approve|reject)$/.exec(url.pathname);
-  if (req.method === 'POST' && approval) {
-    const [ , id, action ] = approval; const tasks = readTasks(); const task = tasks.find(t => t.id === id);
-    if (!task || task.sourceZone !== zone || task.status !== 'pending_approval') return json(res, 404, { error: '未找到可处理的申请单' });
-    task.status = action === 'approve' ? 'released' : 'rejected'; task.approvedAt = new Date().toISOString(); task.approvalBy = `${label(zone)}安全审批（演示）`;
-    if (action === 'approve') fs.copyFileSync(path.join(UPLOAD_DIR, task.physical), path.join(RELEASE_DIR, task.physical));
-    saveTasks(tasks); audit(action === 'approve' ? 'approved_and_released' : 'rejected', task); return json(res, 200, { task: taskView(task, zone) });
-  }
-  const download = /^\/api\/tasks\/([^/]+)\/download$/.exec(url.pathname);
-  if (req.method === 'GET' && download) {
-    const task = readTasks().find(t => t.id === download[1]);
-    if (!task || task.targetZone !== zone || task.status !== 'released') return json(res, 403, { error: '此安全区无权下载该文件' });
-    const filePath = path.join(RELEASE_DIR, task.physical); if (!fs.existsSync(filePath)) return json(res, 404, { error: '交付文件不存在' });
-    task.downloadedAt = new Date().toISOString(); const tasks = readTasks().map(t => t.id === task.id ? task : t); saveTasks(tasks); audit('downloaded', task);
-    res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': `attachment; filename="${encodeURIComponent(task.originalName)}"`, 'content-length': fs.statSync(filePath).size }); return fs.createReadStream(filePath).pipe(res);
-  }
-  return json(res, 404, { error: '接口不存在' });
-}
-function app(fixedZone) { return (req, res) => {
-  const zone = zoneFor(req, fixedZone); if (!zone) return json(res, 403, { error: '未知入口 IP，拒绝访问。请配置 OFFICE_IP 与 RD_IP。' });
-  const url = new URL(req.url, 'http://local');
-  if (url.pathname.startsWith('/api/')) return handleApi(req, res, zone, url);
-  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); return fs.createReadStream(path.join(__dirname, 'public', 'index.html')).pipe(res); }
-  if (req.method === 'GET' && url.pathname === '/app.js') { res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' }); return fs.createReadStream(path.join(__dirname, 'public', 'app.js')).pipe(res); }
-  if (req.method === 'GET' && url.pathname === '/style.css') { res.writeHead(200, { 'content-type': 'text/css; charset=utf-8' }); return fs.createReadStream(path.join(__dirname, 'public', 'style.css')).pipe(res); }
-  json(res, 404, { error: '页面不存在' });
-}; }
-
-if (OFFICE_IP || RD_IP) http.createServer(app()).listen(APP_PORT, '0.0.0.0', () => console.log(`Production-style mode listening on 0.0.0.0:${APP_PORT}; OFFICE_IP=${OFFICE_IP}; RD_IP=${RD_IP}`));
-else {
-  http.createServer(app('office')).listen(PORT_OFFICE, '127.0.0.1', () => console.log(`办公网入口: http://127.0.0.1:${PORT_OFFICE}`));
-  http.createServer(app('rd')).listen(PORT_RD, '127.0.0.1', () => console.log(`研发网入口: http://127.0.0.1:${PORT_RD}`));
-}
+function app(z){return(req,res)=>{const u=new URL(req.url,'http://local');if(u.pathname.startsWith('/api/'))return api(req,res,z,u).catch(e=>json(res,500,{error:'服务器错误'}));const f={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/style.css':'style.css'}[u.pathname];if(!f)return json(res,404,{error:'页面不存在'});res.writeHead(200,{'content-type':f.endsWith('.js')?'application/javascript; charset=utf-8':f.endsWith('.css')?'text/css; charset=utf-8':'text/html; charset=utf-8'});fs.createReadStream(path.join(__dirname,'public',f)).pipe(res)}}
+function bootstrap(){if(load('users').some(x=>x.roles.includes('admin')))return;const u=safe(process.env.BOOTSTRAP_ADMIN_USERNAME,64),p=process.env.BOOTSTRAP_ADMIN_PASSWORD;if(!u||String(p||'').length<12)return console.warn('Set BOOTSTRAP_ADMIN_USERNAME and 12+ char BOOTSTRAP_ADMIN_PASSWORD once.');hash(p).then(h=>{let a=load('users');if(!a.some(x=>x.roles.includes('admin'))){a.push({id:crypto.randomUUID(),username:u,displayName:'Initial Administrator',source:'local',passwordHash:h,roles:['admin','approver','user'],zones:['office','rd'],disabled:false,createdAt:now()});save('users',a);audit('bootstrap_admin_created',{username:u})}})}
+function listen(z,host,port){const opt=process.env.TLS_KEY_FILE&&process.env.TLS_CERT_FILE?{key:fs.readFileSync(process.env.TLS_KEY_FILE),cert:fs.readFileSync(process.env.TLS_CERT_FILE)}:null;(opt?https:http).createServer(opt,app(z)).listen(port,host,()=>console.log(`${zoneName(z)}: ${opt?'https':'http'}://${host}:${port}`))} bootstrap();listen('office',C.officeHost,C.officePort);listen('rd',C.rdHost,C.rdPort);
