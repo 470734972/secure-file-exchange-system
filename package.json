@@ -1,0 +1,9 @@
+{
+  "name": "secure-file-exchange-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "双安全区受控文件交换演示系统",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

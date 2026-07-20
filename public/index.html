@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>受控文件交换平台 · Demo</title><link rel="stylesheet" href="/style.css"></head>
+<body><header><div><p class="eyebrow">SECURE FILE EXCHANGE · DEMO</p><h1>受控文件交换平台</h1></div><div id="zoneBadge" class="zone"></div></header>
+<main><section class="notice"><b>演示边界：</b>当前为同机双入口流程模拟，基础检测/DLP/审批均为模拟能力；它不是网闸、物理隔离或生产系统。</section>
+<section class="flow"><span id="source"></span><i>提交</i><span>隔离交换区</span><i>检测 / 审批</i><span id="target"></span></section>
+<section class="grid"><article class="panel"><h2>创建交换申请</h2><p class="muted">文件将投递到对侧安全区。仅允许 TXT、PDF、CSV、PNG、JPG，单文件不超过 10 MB。</p><form id="uploadForm"><label>选择文件<input name="file" type="file" required accept=".txt,.pdf,.csv,.png,.jpg,.jpeg"></label><label>目标接收人<input name="recipient" required placeholder="例如：张工"></label><label>业务用途<input name="purpose" required placeholder="例如：版本发布资料"></label><label>敏感等级<select name="sensitivity"><option>内部</option><option>受限</option><option>机密（演示）</option></select></label><button>提交并模拟检测</button></form><p id="formMessage" role="status"></p></article>
+<article class="panel"><h2>安全控制</h2><ul><li>入口区域由服务端绑定，前端不能切换。</li><li>文件先落入隔离交换区，审批后才交付。</li><li>演示 DLP 会拦截 <code>SECRET</code> 和私钥特征。</li><li>每个动作写入追加式审计日志。</li></ul></article></section>
+<section class="panel wide"><div class="sectionHead"><div><h2>交换任务</h2><p class="muted">办公入口只能处理办公发起的审批；目标区仅能下载已放行文件。</p></div><button class="ghost" id="refresh">刷新</button></div><div id="tasks" class="tasks"></div></section>
+<section class="panel wide"><h2>审计追溯</h2><div id="audit" class="audit"></div></section></main><footer>Demo · 单系统双安全域入口 · 不信任 Host、X-Forwarded-For 或页面区域参数</footer><script src="/app.js"></script></body></html>
