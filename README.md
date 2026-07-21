@@ -13,6 +13,7 @@
 - AD 登录：仅接受 LDAPS，按 AD 组映射 `user`、`approver`、`admin`。
 - 服务端会话、`HttpOnly`/`SameSite=Strict` Cookie、CSRF 校验和本地密码 scrypt 哈希。
 - 文件提交、基础类型与敏感特征拦截、双人审批、目标用户下载、SHA-256 与审计记录。
+- 管理员审计台：仅本地 `admin` 角色或映射为 AD 管理员组的用户可查看当前安全区的登录、流转、审批和下载事件。
 - 已允许文本、PDF、Office（Word/Excel/PowerPoint）、常见图片、ZIP/RAR/7Z/TAR/GZ 等压缩包、RPM/DEB 和 DWG；可执行文件与脚本仍默认拒绝。
 
 ## 部署
