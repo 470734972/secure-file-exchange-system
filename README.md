@@ -25,7 +25,7 @@ sudo vi /etc/secure-file-exchange/sfx.env
 sudo systemctl enable --now secure-file-exchange
 ```
 
-先在 `sfx.env` 设置一次性初始管理员（至少 12 位密码）：
+先在 `sfx.env` 设置一次性初始管理员（至少 8 位密码）：
 
 ```ini
 BOOTSTRAP_ADMIN_USERNAME=sfxadmin
