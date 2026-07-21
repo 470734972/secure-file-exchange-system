@@ -13,6 +13,7 @@
 - AD 登录：仅接受 LDAPS，按 AD 组映射 `user`、`approver`、`admin`。
 - 服务端会话、`HttpOnly`/`SameSite=Strict` Cookie、CSRF 校验和本地密码 scrypt 哈希。
 - 文件提交、基础类型与敏感特征拦截、双人审批、目标用户下载、SHA-256 与审计记录。
+- 已允许文本、PDF、Office（Word/Excel/PowerPoint）、常见图片、ZIP/RAR/7Z/TAR/GZ 等压缩包、RPM/DEB 和 DWG；可执行文件与脚本仍默认拒绝。
 
 ## 部署
 
@@ -24,6 +25,17 @@ sudo install -m 0640 -o root -g sfx deploy/sfx.env.example /etc/secure-file-exch
 sudo vi /etc/secure-file-exchange/sfx.env
 sudo systemctl enable --now secure-file-exchange
 ```
+
+## 一键升级
+
+已部署的 Rocky 服务器执行以下命令，可自动备份、拉取最新代码、更新依赖并重启服务：
+
+```bash
+cd /opt/secure-file-exchange
+sudo ./deploy/rocky-upgrade.sh
+```
+
+脚本默认升级 `codex/secure-file-exchange-system` 分支，备份保存到 `/var/backups/secure-file-exchange/<时间戳>/`。检测到本机未提交代码时会安全停止，不会强制覆盖。
 
 先在 `sfx.env` 设置一次性初始管理员（至少 8 位密码）：
 
